@@ -9,7 +9,7 @@ from datetime import datetime
 import aiosqlite
 from fastapi import FastAPI
 from fastapi.staticfiles import StaticFiles
-from fastapi.responses import JSONResponse, PlainTextResponse
+from fastapi.responses import JSONResponse
 import uvicorn
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, WebAppInfo
@@ -183,24 +183,32 @@ async def debug_files():
 # API endpoints
 @app.get("/api/cases")
 async def api_cases():
-    async with aiosqlite.connect(DB_PATH) as db:
-        rows = await db.execute("SELECT id, title, image, payload_json, price FROM cases ORDER BY id").fetchall()
-    out = []
-    for cid, title, image, payload_json, price in rows:
-        payload = json.loads(payload_json) if payload_json else {}
-        out.append({"id": cid, "title": title, "image": image, "payload": payload, "price": price})
-    return out
+    try:
+        async with aiosqlite.connect(DB_PATH) as db:
+            cur = await db.execute("SELECT id, title, image, payload_json, price FROM cases ORDER BY id")
+            rows = await cur.fetchall()
+        out = []
+        for cid, title, image, payload_json, price in rows:
+            payload = json.loads(payload_json) if payload_json else {}
+            out.append({"id": cid, "title": title, "image": image, "payload": payload, "price": price})
+        return out
+    except Exception as e:
+        logger.exception("Error in /api/cases: %s", e)
+        return JSONResponse({"error": "internal"}, status_code=500)
 
 @app.get("/api/case/{case_id}")
 async def api_case(case_id: int):
-    async with aiosqlite.connect(DB_PATH) as db:
-        row = await db.execute(
-            "SELECT id, title, image, payload_json, price FROM cases WHERE id = ?", (case_id,)
-        ).fetchone()
-    if not row:
-        return JSONResponse({"error": "not found"}, status_code=404)
-    cid, title, image, payload_json, price = row
-    return {"id": cid, "title": title, "image": image, "payload": json.loads(payload_json) if payload_json else {}, "price": price}
+    try:
+        async with aiosqlite.connect(DB_PATH) as db:
+            cur = await db.execute("SELECT id, title, image, payload_json, price FROM cases WHERE id = ?", (case_id,))
+            row = await cur.fetchone()
+        if not row:
+            return JSONResponse({"error": "not found"}, status_code=404)
+        cid, title, image, payload_json, price = row
+        return {"id": cid, "title": title, "image": image, "payload": json.loads(payload_json) if payload_json else {}, "price": price}
+    except Exception as e:
+        logger.exception("Error in /api/case/%s: %s", case_id, e)
+        return JSONResponse({"error": "internal"}, status_code=500)
 
 # -----------------------------
 # Telegram bot
@@ -208,7 +216,6 @@ async def api_case(case_id: int):
 def admin_only(func):
     async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if update.effective_user.id != ADMIN_ID:
-            # silent return for non-admins
             if update.message:
                 await update.message.reply_text("У вас нет прав администратора.")
             return
@@ -283,7 +290,8 @@ def build_bot_app():
 
         if action == "open_case" and case_id:
             async with aiosqlite.connect(DB_PATH) as db:
-                row = await db.execute("SELECT payload_json FROM cases WHERE id=?", (case_id,)).fetchone()
+                cur = await db.execute("SELECT payload_json FROM cases WHERE id=?", (case_id,))
+                row = await cur.fetchone()
                 if not row:
                     await msg.reply_text("Кейс не найден.")
                     return
@@ -348,8 +356,8 @@ async def startup_event():
         # Remove webhook if set — safe step before polling
         try:
             logger.info("Deleting webhook (if any) before starting polling...")
-            await _bot_app.bot.delete_webhook(drop_pending_updates=True)
-            logger.info("delete_webhook() completed")
+            res = await _bot_app.bot.delete_webhook(drop_pending_updates=True)
+            logger.info("delete_webhook() result: %s", res)
         except Exception as e:
             logger.warning("delete_webhook() failed or not necessary: %s", e)
 
