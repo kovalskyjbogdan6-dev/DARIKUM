@@ -4,28 +4,36 @@ import base64
 import logging
 import random
 import asyncio
-from datetime import datetime, timedelta
+from datetime import datetime
 
 import aiosqlite
 from fastapi import FastAPI
 from fastapi.staticfiles import StaticFiles
+from fastapi.responses import JSONResponse, PlainTextResponse
 import uvicorn
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, WebAppInfo
 from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, filters, ContextTypes
 
+# -----------------------------
 # Config
+# -----------------------------
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 ADMIN_ID = int(os.getenv("ADMIN_ID", "1040670594"))
 DB_PATH = os.getenv("DB_PATH", "darikum.db")
+
+# Support both names: WEBAPP_BASE_URL or WEBAPP_URL
 _webapp_env = os.getenv("WEBAPP_BASE_URL") or os.getenv("WEBAPP_URL") or ""
 WEBAPP_BASE_URL = _webapp_env.rstrip("/") if _webapp_env else ""
+
 PORT = int(os.getenv("PORT", "8000"))
 
 logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("main")
 
+# -----------------------------
 # Helpers
+# -----------------------------
 def now_iso():
     return datetime.utcnow().isoformat()
 
@@ -50,7 +58,9 @@ def weighted_pick(items):
             return it.get("label")
     return items[0].get("label")
 
+# -----------------------------
 # Database initialization
+# -----------------------------
 async def init_db():
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute(
@@ -99,7 +109,7 @@ async def init_db():
         )
         await db.commit()
 
-        # Seed sample cases if table empty
+        # Seed sample cases if empty
         cur = await db.execute("SELECT COUNT(*) FROM cases")
         row = await cur.fetchone()
         cnt = row[0] if row else 0
@@ -144,16 +154,33 @@ async def init_db():
             await db.commit()
             logger.info("Seeded sample cases")
 
-# FastAPI app & static files
+# -----------------------------
+# FastAPI app & static
+# -----------------------------
 WEBAPP_DIR = os.path.join(os.path.dirname(__file__), "webapp")
 app = FastAPI()
 
 if os.path.isdir(WEBAPP_DIR):
-    app.mount(
-        "/webapp",
-        StaticFiles(directory=WEBAPP_DIR),
-        name="webapp"
-    )
+    app.mount("/webapp", StaticFiles(directory=WEBAPP_DIR), name="webapp")
+    app.mount("/", StaticFiles(directory=WEBAPP_DIR), name="root")
+
+# Health/debug endpoints to help diagnose deployment
+@app.get("/health")
+async def health():
+    return {"status": "ok"}
+
+@app.get("/debug-files", include_in_schema=False)
+async def debug_files():
+    import os
+    webdir = WEBAPP_DIR
+    exists = os.path.isdir(webdir)
+    try:
+        listing = os.listdir(webdir)[:100] if exists else []
+    except Exception as e:
+        listing = [str(e)]
+    return JSONResponse({"WEBAPP_BASE_URL": WEBAPP_BASE_URL, "webapp_dir_exists": exists, "webapp_files_sample": listing})
+
+# API endpoints
 @app.get("/api/cases")
 async def api_cases():
     async with aiosqlite.connect(DB_PATH) as db:
@@ -163,18 +190,27 @@ async def api_cases():
         payload = json.loads(payload_json) if payload_json else {}
         out.append({"id": cid, "title": title, "image": image, "payload": payload, "price": price})
     return out
-if os.path.isdir(WEBAPP_DIR):
-    app.mount(
-        "/",
-        StaticFiles(directory=WEBAPP_DIR, html=True),
-        name="root"
-    )
 
+@app.get("/api/case/{case_id}")
+async def api_case(case_id: int):
+    async with aiosqlite.connect(DB_PATH) as db:
+        row = await db.execute(
+            "SELECT id, title, image, payload_json, price FROM cases WHERE id = ?", (case_id,)
+        ).fetchone()
+    if not row:
+        return JSONResponse({"error": "not found"}, status_code=404)
+    cid, title, image, payload_json, price = row
+    return {"id": cid, "title": title, "image": image, "payload": json.loads(payload_json) if payload_json else {}, "price": price}
+
+# -----------------------------
 # Telegram bot
+# -----------------------------
 def admin_only(func):
     async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if update.effective_user.id != ADMIN_ID:
-            await update.message.reply_text("У вас нет прав администратора.")
+            # silent return for non-admins
+            if update.message:
+                await update.message.reply_text("У вас нет прав администратора.")
             return
         return await func(update, context)
     return wrapper
@@ -203,7 +239,8 @@ def build_bot_app():
         await ensure_user(user)
         weburl = make_webapp_url({"mode": "shop"})
         kb = InlineKeyboardMarkup([[InlineKeyboardButton("Открыть магазин кейсов", web_app=WebAppInfo(weburl))]])
-        await update.message.reply_text("Привет! Открой магазин кейсов:", reply_markup=kb)
+        if update.message:
+            await update.message.reply_text("Привет! Открой магазин кейсов:", reply_markup=kb)
 
     @admin_only
     async def cmd_add_case(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -281,7 +318,9 @@ def build_bot_app():
     app_bot.add_handler(MessageHandler(filters.ALL, handle_webapp_message))
     return app_bot
 
-# Startup / shutdown
+# -----------------------------
+# Startup / shutdown with webhook removal & robust polling
+# -----------------------------
 _bot_app = None
 _bot_polling_task = None
 
@@ -301,13 +340,30 @@ async def startup_event():
         return
 
     try:
+        logger.info("Initializing telegram application...")
         await _bot_app.initialize()
+        logger.info("Starting telegram application...")
         await _bot_app.start()
 
+        # Remove webhook if set — safe step before polling
+        try:
+            logger.info("Deleting webhook (if any) before starting polling...")
+            await _bot_app.bot.delete_webhook(drop_pending_updates=True)
+            logger.info("delete_webhook() completed")
+        except Exception as e:
+            logger.warning("delete_webhook() failed or not necessary: %s", e)
+
+        # Start polling as background task (PTB 20.x)
         if getattr(_bot_app, "updater", None) is not None and hasattr(_bot_app.updater, "start_polling"):
-            _bot_polling_task = asyncio.create_task(_bot_app.updater.start_polling())
+            try:
+                _bot_polling_task = asyncio.create_task(_bot_app.updater.start_polling())
+                logger.info("Polling started in background task.")
+            except Exception as e:
+                logger.exception("Failed to start polling background task: %s", e)
+        else:
+            logger.warning("Updater or start_polling not available; polling not started")
     except Exception:
-        logger.exception("Failed to start bot in startup_event")
+        logger.exception("Failed to start bot in startup_event, attempting shutdown")
         try:
             await _bot_app.shutdown()
         except Exception:
@@ -318,6 +374,8 @@ async def shutdown_event():
     global _bot_app, _bot_polling_task
     if _bot_app is None:
         return
+
+    logger.info("Shutting down Telegram bot...")
 
     try:
         if getattr(_bot_app, "updater", None) is not None and hasattr(_bot_app.updater, "stop_polling"):
@@ -350,5 +408,8 @@ async def shutdown_event():
     _bot_app = None
     _bot_polling_task = None
 
+# -----------------------------
+# Run
+# -----------------------------
 if __name__ == "__main__":
     uvicorn.run("main:app", host="0.0.0.0", port=PORT, log_level="info")
