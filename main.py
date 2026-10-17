@@ -6,7 +6,7 @@ from fastapi import FastAPI
 from fastapi.staticfiles import StaticFiles
 import uvicorn
 
-from bot import build_bot_app, init_db
+from webapp.bot import build_bot_app, init_db
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
