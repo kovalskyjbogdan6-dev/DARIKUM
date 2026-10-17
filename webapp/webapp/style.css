@@ -1,46 +1,66 @@
+/* Новый дизайн для DARIKUM mini‑app
+   - glassmorphism, градиенты, плавные тени
+   - акцент на карточки кейсов, крупные изображения
+   - адаптивная сетка
+*/
+
 :root{
-  --bg:#071428;
-  --card:#0f2a44;
-  --accent:#00d4ff;
-  --glass: rgba(255,255,255,0.03);
-  --text:#e6f7ff;
+  --bg-1: #0b1220;
+  --bg-2: #071428;
+  --card: rgba(255,255,255,0.04);
+  --card-2: rgba(255,255,255,0.02);
+  --glass-border: rgba(255,255,255,0.06);
+  --accent: linear-gradient(90deg, #6df0ff 0%, #6bc8ff 40%, #7ad5ff 100%);
+  --accent-plain: #6df0ff;
+  --muted: #9fb7c9;
+  --text: #eaf8ff;
+  --gold: #ffd36b;
+  --shadow: 0 10px 30px rgba(2,6,23,0.6);
+  --radius: 14px;
+  --card-padding: 14px;
+  font-synthesis: none;
 }
+
+/* base */
+*{box-sizing:border-box}
+html,body{height:100%}
 body{
   margin:0;
-  font-family: Inter, system-ui, Arial;
-  background:linear-gradient(180deg,var(--bg),#02131f);
+  font-family: Inter, system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial;
+  background: radial-gradient(1200px 600px at 10% 10%, rgba(20,80,110,0.12), transparent 6%),
+              radial-gradient(1000px 500px at 90% 90%, rgba(120,40,90,0.06), transparent 8%),
+              linear-gradient(180deg, var(--bg-1) 0%, var(--bg-2) 100%);
   color:var(--text);
   -webkit-font-smoothing:antialiased;
+  -moz-osx-font-smoothing:grayscale;
+  padding:18px;
 }
-#app{padding:16px;}
-header h1{margin:0;font-size:20px;color:var(--accent)}
-header p{margin:4px 0 16px;color:#9fc7d8}
-.card{
-  background:var(--card);
-  border-radius:12px;
-  padding:12px;
-  margin-bottom:12px;
-  box-shadow: 0 4px 18px rgba(0,0,0,0.4);
-}
-button.cta{
-  background:linear-gradient(90deg,var(--accent),#6ef2ff);
-  border:none;
-  padding:10px 14px;
-  border-radius:10px;
-  color:#012;
-  font-weight:700;
-  cursor:pointer;
-}
-.small{font-size:13px;color:#9dbccf}
-.wheel{
+
+/* shell */
+#app{max-width:1100px;margin:0 auto}
+header{
   display:flex;
-  flex-wrap:wrap;
-  gap:8px;
+  align-items:center;
+  justify-content:space-between;
+  gap:12px;
+  margin-bottom:18px;
 }
-.wheel .slice{
-  background:var(--glass);
-  padding:8px 10px;
-  border-radius:8px;
-  min-width:120px;
-  text-align:center;
+.header-left{display:flex;gap:12px;align-items:center}
+.brand{
+  display:flex;flex-direction:column;
 }
+.brand h1{
+  margin:0;font-size:20px;letter-spacing:0.3px;
+  background:var(--accent);
+  -webkit-background-clip:text;
+  -webkit-text-fill-color:transparent;
+}
+.brand p{margin:0;font-size:12px;color:var(--muted)}
+
+/* top bar icons */
+.header-actions{display:flex;gap:8px;align-items:center}
+.icon-btn{
+  width:40px;height:40px;border-radius:10px;background:linear-gradient(180deg, rgba(255,255,255,0.03), rgba(255,255,255,0.01));
+  display:inline-flex;align-items:center;justify-content:center;color:var(--muted);cursor:pointer;border:1px solid var(--card-2);
+  transition:transform .*
+
