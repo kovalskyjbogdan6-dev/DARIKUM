@@ -1,23 +1,16 @@
 import os
 import json
-import base64
 import random
 import logging
 from datetime import datetime, timedelta
 
 import aiosqlite
-from telegram import (
-    Update,
-    InlineKeyboardButton,
-    InlineKeyboardMarkup,
-    WebAppInfo,
-)
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     ApplicationBuilder,
+    CallbackContext,
     CommandHandler,
     CallbackQueryHandler,
-    MessageHandler,
-    filters,
     ContextTypes,
 )
 
@@ -27,19 +20,43 @@ logger = logging.getLogger(__name__)
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 ADMIN_ID = int(os.getenv("ADMIN_ID", "1040670594"))
 DB_PATH = os.getenv("DB_PATH", "darikum.db")
-WEBAPP_BASE_URL = os.getenv("WEBAPP_BASE_URL", "").rstrip("/")
+
 
 def now_iso():
     return datetime.utcnow().isoformat()
 
+
+def admin_only(func):
+    async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        user_id = update.effective_user.id
+        if user_id != ADMIN_ID:
+            await update.message.reply_text("У вас нет прав администратора.")
+            return
+        return await func(update, context)
+    return wrapper
+
+
 async def init_db():
     async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("""
+        await db.execute(
+            """
+            CREATE TABLE IF NOT EXISTS users (
+                user_id INTEGER PRIMARY KEY,
+                username TEXT,
+                points INTEGER DEFAULT 0,
+                streak INTEGER DEFAULT 0,
+                last_claim TEXT,
+                created_at TEXT
+            )
+            """
+        )
+        await db.execute(
+            """
             CREATE TABLE IF NOT EXISTS games (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 title TEXT,
-                mode TEXT,
-                payload_json TEXT,
+                mode TEXT DEFAULT 'spin',
+                wheel_json TEXT,
                 status TEXT DEFAULT 'open',
                 created_at TEXT,
                 ends_at TEXT,
@@ -47,8 +64,10 @@ async def init_db():
                 winner_user_id INTEGER,
                 winner_name TEXT
             )
-        """)
-        await db.execute("""
+            """
+        )
+        await db.execute(
+            """
             CREATE TABLE IF NOT EXISTS participants (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 game_id INTEGER,
@@ -57,255 +76,494 @@ async def init_db():
                 joined_at TEXT,
                 UNIQUE(game_id, user_id)
             )
-        """)
-        await db.execute("""
-            CREATE TABLE IF NOT EXISTS users (
+            """
+        )
+        await db.execute(
+            """
+            CREATE TABLE IF NOT EXISTS user_stats (
                 user_id INTEGER PRIMARY KEY,
-                username TEXT,
-                points INTEGER DEFAULT 0,
-                streak INTEGER DEFAULT 0,
-                created_at TEXT
+                wins INTEGER DEFAULT 0,
+                spins INTEGER DEFAULT 0
             )
-        """)
+            """
+        )
         await db.commit()
+
 
 async def ensure_user(user):
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute(
-            "INSERT OR IGNORE INTO users (user_id, username, points, streak, created_at) VALUES (?, ?, 0, 0, ?)",
+            """
+            INSERT OR IGNORE INTO users (user_id, username, points, streak, created_at)
+            VALUES (?, ?, 0, 0, ?)
+            """,
             (user.id, user.username or user.full_name, now_iso()),
+        )
+        await db.execute(
+            """
+            INSERT OR IGNORE INTO user_stats (user_id, wins, spins)
+            VALUES (?, 0, 0)
+            """,
+            (user.id,),
         )
         await db.commit()
 
+
 def weighted_pick(items):
-    total = sum(int(item.get("weight", 1)) for item in items)
+    total = sum(item["weight"] for item in items)
     r = random.randint(1, total)
     acc = 0
     for item in items:
-        acc += int(item.get("weight", 1))
+        acc += item["weight"]
         if r <= acc:
-            return item.get("label")
-    return items[0].get("label")
+            return item["label"]
+    return items[0]["label"]
 
-def encode_payload(payload: dict) -> str:
-    s = json.dumps(payload)
-    b = base64.b64encode(s.encode("utf-8")).decode("utf-8")
-    return b
-
-def make_webapp_url(payload: dict) -> str:
-    if not WEBAPP_BASE_URL:
-        return "https://example.com/invalid"  # placeholder
-    enc = encode_payload(payload)
-    return f"{WEBAPP_BASE_URL}/?data={enc}"
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     await ensure_user(user)
-    await update.message.reply_text(
-        "Привет! DARIKUM готов. Открой мини-приложение через кнопку или используй /list."
+    text = (
+        "🎉 Добро пожаловать в DARIKUM!\n\n"
+        "Это новое мини-приложение для Telegram-розыгрышей.\n"
+        "Здесь используется уникальная механика Spin-the-Wheel.\n\n"
+        "Команды:\n"
+        "/list — посмотреть активные розыгрыши\n"
+        "/join <id> — участвовать в розыгрыше\n"
+        "/my — профиль и очки\n"
+        "/help — помощь\n"
     )
+    keyboard = InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton("🎡 Открыть розыгрыши", callback_data="list_games")],
+            [InlineKeyboardButton("👤 Мой профиль", callback_data="profile")],
+        ]
+    )
+    await update.message.reply_text(text, reply_markup=keyboard)
+
+
+async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = (
+        "Список команд DARIKUM:\n\n"
+        "/start — старт\n"
+        "/list — активные розыгрыши\n"
+        "/join <id> — присоединиться к розыгрышу\n"
+        "/my — профиль\n"
+        "/create_spin <title>|<minutes>|<label:weight,...> — создать колесо\n"
+        "/end_spin <id> — завершить розыгрыш \n"
+        "/stats — статистика\n"
+        "/admin — админ-команды\n"
+    )
+    await update.message.reply_text(text)
+
+
+async def cmd_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != ADMIN_ID:
+        await update.message.reply_text("Доступ только для администратора.")
+        return
+
+    text = (
+        "Админ-команды:\n"
+        "/create_spin <title>|<minutes>|<label:weight,...>\n"
+        "/end_spin <id>\n"
+        "/stats\n"
+    )
+    await update.message.reply_text(text)
+
 
 async def cmd_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
     async with aiosqlite.connect(DB_PATH) as db:
-        rows = await db.execute("SELECT id, title, mode, status, ends_at FROM games WHERE status='open'").fetchall()
-    if not rows:
-        await update.message.reply_text("Нет активных игр.")
-        return
-    lines = []
-    kb = []
-    for gid, title, mode, status, ends_at in rows:
-        lines.append(f"#{gid} — {title} ({mode}) — до {ends_at}")
-        kb.append([InlineKeyboardButton(f"Открыть #{gid}", web_app=WebAppInfo(make_webapp_url({"mode": mode, "game_id": gid})))])
-    await update.message.reply_text("\n".join(lines), reply_markup=InlineKeyboardMarkup(kb))
+        rows = await db.execute(
+            "SELECT id, title, mode, status, ends_at FROM games WHERE status='open' ORDER BY id DESC"
+        ).fetchall()
 
-def admin_only(func):
-    async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
-        uid = update.effective_user.id
-        if uid != ADMIN_ID:
-            await update.message.reply_text("Только админ.")
+    if not rows:
+        await update.message.reply_text("Сейчас нет активных розыгрышей.")
+        return
+
+    lines = ["🎡 Активные розыгрыши:"]
+    for game in rows:
+        gid, title, mode, status, ends_at = game
+        lines.append(f"#{gid} — {title} ({mode}) — до {ends_at}")
+    await update.message.reply_text("\n".join(lines))
+
+
+async def cmd_join(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.args:
+        await update.message.reply_text("Использование: /join <id>")
+        return
+
+    game_id = int(context.args[0])
+    user = update.effective_user
+    await ensure_user(user)
+
+    async with aiosqlite.connect(DB_PATH) as db:
+        row = await db.execute(
+            "SELECT id, status FROM games WHERE id=?",
+            (game_id,),
+        ).fetchone()
+
+        if not row:
+            await update.message.reply_text("Розыгрыш не найден.")
             return
-        return await func(update, context)
-    return wrapper
+
+        if row[1] != "open":
+            await update.message.reply_text("Этот розыгрыш уже закрыт.")
+            return
+
+        await db.execute(
+            """
+            INSERT OR IGNORE INTO participants(game_id, user_id, username, joined_at)
+            VALUES (?, ?, ?, ?)
+            """,
+            (game_id, user.id, user.username or user.full_name, now_iso()),
+        )
+        await db.commit()
+
+    await update.message.reply_text(f"Вы участвуете в розыгрыше #{game_id}.")
+
+
+async def cmd_my(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    await ensure_user(user)
+
+    async with aiosqlite.connect(DB_PATH) as db:
+        user_row = await db.execute(
+            "SELECT points, streak FROM users WHERE user_id=?",
+            (user.id,),
+        ).fetchone()
+        stats_row = await db.execute(
+            "SELECT wins, spins FROM user_stats WHERE user_id=?",
+            (user.id,),
+        ).fetchone()
+
+    if not user_row:
+        await update.message.reply_text("Профиль пока пустой.")
+        return
+
+    points, streak = user_row
+    wins, spins = stats_row if stats_row else (0, 0)
+
+    text = (
+        f"👤 Профиль: @{user.username or user.full_name}\n"
+        f"💎 Очки: {points}\n"
+        f"🔥 Стрик: {streak}\n"
+        f"🏆 Победы: {wins}\n"
+        f"🎡 Круток: {spins}\n"
+    )
+    await update.message.reply_text(text)
+
 
 @admin_only
 async def cmd_create_spin(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # format: /create_spin Title|minutes|label:weight,label:weight,...
-    raw = " ".join(context.args) if context.args else ""
-    if not raw:
-        await update.message.reply_text("Использование: /create_spin Title|minutes|label:weight,label:weight,...")
+    if not context.args:
+        await update.message.reply_text(
+            "Использование: /create_spin <title>|<minutes>|<label:weight,label:weight,...>"
+        )
         return
-    try:
-        title, minutes_s, wheel_raw = [p.strip() for p in raw.split("|", 2)]
-        minutes = int(minutes_s)
-    except Exception:
-        await update.message.reply_text("Неверный формат. Пример:\n/create_spin Лунный шанс|30|Стикер:30,Бонус:25")
+
+    raw = " ".join(context.args).strip()
+    parts = [p.strip() for p in raw.split("|")]
+
+    if len(parts) != 3:
+        await update.message.reply_text(
+            "Неверный формат. Пример:\n"
+            "/create_spin Лунный шанс|30|Стикер:30,Бонус:25,Промокод:20,Ключ:15,Подарок:10"
+        )
         return
-    slices = []
+
+    title, minutes_raw, wheel_raw = parts
     try:
-        for it in wheel_raw.split(","):
-            lbl, wt = [x.strip() for x in it.split(":", 1)]
-            slices.append({"label": lbl, "weight": int(wt)})
+        minutes = int(minutes_raw)
+    except ValueError:
+        await update.message.reply_text("Минуты должны быть числом.")
+        return
+
+    try:
+        slices = []
+        for item in wheel_raw.split(","):
+            label, weight = [p.strip() for p in item.split(":")]
+            slices.append({"label": label, "weight": int(weight)})
     except Exception:
-        await update.message.reply_text("Ошибка разбора секторов.")
+        await update.message.reply_text("Формат секторов неверный. Пример: label:weight,label:weight")
+        return
+
+    if not slices:
+        await update.message.reply_text("Нужно хотя бы 1 поле колеса.")
         return
 
     ends_at = (datetime.utcnow() + timedelta(minutes=minutes)).isoformat()
-    payload = {"mode":"spin","title": title, "slices": slices}
+
     async with aiosqlite.connect(DB_PATH) as db:
         cur = await db.execute(
-            "INSERT INTO games(title, mode, payload_json, status, created_at, ends_at) VALUES (?, ?, ?, 'open', ?, ?)",
-            (title, "spin", json.dumps(payload), now_iso(), ends_at),
+            """
+            INSERT INTO games(title, mode, wheel_json, status, created_at, ends_at)
+            VALUES (?, 'spin', ?, 'open', ?, ?)
+            """,
+            (title, json.dumps(slices), now_iso(), ends_at),
         )
         await db.commit()
-        gid = cur.lastrowid
+        game_id = cur.lastrowid
 
-    weburl = make_webapp_url({"mode":"spin", "game_id": gid, "title": title, "slices": slices})
-    kb = InlineKeyboardMarkup([[InlineKeyboardButton("Открыть мини-приложение", web_app=WebAppInfo(weburl))]])
-    await update.message.reply_text(f"Создан Spin #{gid}\nДо: {ends_at}", reply_markup=kb)
+    text = (
+        f"🎡 Создан розыгрыш #{game_id}\n"
+        f"Название: {title}\n"
+        f"Время: {minutes} минут\n"
+        f"Формат: Spin-the-Wheel\n"
+        f"До: {ends_at}\n"
+    )
+
+    keyboard = InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton("🎡 Крутить колесо", callback_data=f"spin:{game_id}")]
+        ]
+    )
+
+    await update.message.reply_text(text, reply_markup=keyboard)
+    logger.info("Created spin %s", game_id)
+
 
 @admin_only
-async def cmd_create_vault(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # format: /create_vault Title|minutes|label:weight,label:weight,...
-    raw = " ".join(context.args) if context.args else ""
-    if not raw:
-        await update.message.reply_text("Использование: /create_vault Title|minutes|label:weight,label:weight,...")
-        return
-    try:
-        title, minutes_s, prizes_raw = [p.strip() for p in raw.split("|", 2)]
-        minutes = int(minutes_s)
-    except Exception:
-        await update.message.reply_text("Неверный формат. Пример:\n/create_vault Тайный сундук|45|Промокод:40,Стикер:30,Ключ:20,Редкий:10")
-        return
-    prizes = []
-    try:
-        for it in prizes_raw.split(","):
-            lbl, wt = [x.strip() for x in it.split(":", 1)]
-            prizes.append({"label": lbl, "weight": int(wt)})
-    except Exception:
-        await update.message.reply_text("Ошибка разбора призов.")
+async def cmd_end_spin(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.args:
+        await update.message.reply_text("Использование: /end_spin <id>")
         return
 
-    ends_at = (datetime.utcnow() + timedelta(minutes=minutes)).isoformat()
-    payload = {"mode":"vault","title": title, "prizes": prizes}
+    game_id = int(context.args[0])
+
     async with aiosqlite.connect(DB_PATH) as db:
-        cur = await db.execute(
-            "INSERT INTO games(title, mode, payload_json, status, created_at, ends_at) VALUES (?, ?, ?, 'open', ?, ?)",
-            (title, "vault", json.dumps(payload), now_iso(), ends_at),
+        game = await db.execute(
+            "SELECT id, title, wheel_json, status, winner_user_id FROM games WHERE id=?",
+            (game_id,),
+        ).fetchone()
+
+        if not game:
+            await update.message.reply_text("Розыгрыш не найден.")
+            return
+
+        if game[3] == "closed":
+            await update.message.reply_text("Розыгрыш уже закрыт.")
+            return
+
+        wheel = json.loads(game[2])
+        result = weighted_pick(wheel)
+        winner_user_id = game[4]
+
+        await db.execute(
+            """
+            UPDATE games
+            SET status='closed', result=?, closed_at=?, winner_name='manual'
+            WHERE id=?
+            """,
+            (result, now_iso(), game_id),
         )
         await db.commit()
-        gid = cur.lastrowid
 
-    weburl = make_webapp_url({"mode":"vault", "game_id": gid, "title": title, "prizes": prizes})
-    kb = InlineKeyboardMarkup([[InlineKeyboardButton("Открыть мини-приложение", web_app=WebAppInfo(weburl))]])
-    await update.message.reply_text(f"Создан Mystery Vault #{gid}\nДо: {ends_at}", reply_markup=kb)
+    await update.message.reply_text(
+        f"🎯 Розыгрыш #{game_id} завершён вручную.\n"
+        f"Результат: {result}"
+    )
 
-async def handle_webapp_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    msg = update.message
-    if not msg or not getattr(msg, "web_app_data", None):
+
+async def callback_list_games(update: Update, context: CallbackContext):
+    query = update.callback_query
+    await query.answer()
+
+    async with aiosqlite.connect(DB_PATH) as db:
+        rows = await db.execute(
+            "SELECT id, title, ends_at FROM games WHERE status='open' ORDER BY id DESC"
+        ).fetchall()
+
+    if not rows:
+        await query.edit_message_text("Сейчас нет активных розыгрышей.")
         return
+
+    lines = ["🎡 Активные розыгрыши:"]
+    buttons = []
+
+    for gid, title, ends_at in rows:
+        lines.append(f"#{gid} — {title} — до {ends_at}")
+        buttons.append([InlineKeyboardButton(f"🎡 #{gid}", callback_data=f"spin:{gid}")])
+
+    text = "\n".join(lines)
+    await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(buttons))
+
+
+async def callback_profile(update: Update, context: CallbackContext):
+    query = update.callback_query
+    user = query.from_user
+    await ensure_user(user)
+
+    async with aiosqlite.connect(DB_PATH) as db:
+        row = await db.execute(
+            "SELECT points, streak FROM users WHERE user_id=?",
+            (user.id,),
+        ).fetchone()
+        stats = await db.execute(
+            "SELECT wins, spins FROM user_stats WHERE user_id=?",
+            (user.id,),
+        ).fetchone()
+
+    points, streak = row if row else (0, 0)
+    wins, spins = stats if stats else (0, 0)
+
+    text = (
+        f"👤 Профиль: @{user.username or user.full_name}\n"
+        f"💎 Очки: {points}\n"
+        f"🔥 Стрик: {streak}\n"
+        f"🏆 Победы: {wins}\n"
+        f"🎡 Круток: {spins}\n"
+    )
+    await query.answer()
+    await query.edit_message_text(text)
+
+
+async def callback_spin(update: Update, context: CallbackContext):
+    query = update.callback_query
+    user = query.from_user
+    await ensure_user(user)
+
+    payload = query.data.split(":")
+    if len(payload) != 2:
+        await query.answer("Некорректный запрос.", show_alert=True)
+        return
+
+    game_id = int(payload[1])
+
+    async with aiosqlite.connect(DB_PATH) as db:
+        game = await db.execute(
+            "SELECT id, title, wheel_json, status, winner_user_id, winner_name FROM games WHERE id=?",
+            (game_id,),
+        ).fetchone()
+
+        if not game:
+            await query.answer("Розыгрыш не найден.", show_alert=True)
+            return
+
+        gid, title, wheel_json, status, winner_user_id, winner_name = game
+
+        if status != "open":
+            await query.answer("Этот розыгрыш уже закрыт.", show_alert=True)
+            return
+
+        # add user to participants
+        await db.execute(
+            """
+            INSERT OR IGNORE INTO participants(game_id, user_id, username, joined_at)
+            VALUES (?, ?, ?, ?)
+            """,
+            (gid, user.id, user.username or user.full_name, now_iso()),
+        )
+
+        wheel = json.loads(wheel_json)
+        result = weighted_pick(wheel)
+
+        # award user points a bit
+        await db.execute(
+            """
+            UPDATE users
+            SET points = points + 10, streak = streak + 1
+            WHERE user_id = ?
+            """,
+            (user.id,),
+        )
+
+        await db.execute(
+            """
+            UPDATE user_stats
+            SET spins = spins + 1
+            WHERE user_id = ?
+            """,
+            (user.id,),
+        )
+
+        await db.execute(
+            """
+            UPDATE games
+            SET status='closed', result=?, winner_user_id=?, winner_name=?, closed_at=?
+            WHERE id=?
+            """,
+            (result, user.id, user.username or user.full_name, now_iso(), gid),
+        )
+        await db.commit()
+
+    # send a message to chat with final result
+    await query.answer(f"🎡 Результат: {result}", show_alert=True)
+    await query.edit_message_text(
+        f"🎡 Колесо фортуны в розыгрыше #{gid}\n"
+        f"Название: {title}\n"
+        f"Результат: {result}\n"
+        f"Победитель: @{user.username or user.full_name}\n"
+        f"Награда: {result}"
+    )
+
     try:
-        data_raw = msg.web_app_data.data
-        data = json.loads(data_raw)
-    except Exception as e:
-        await msg.reply_text("Ошибка данных от мини-приложения.")
-        logger.exception("Invalid web_app_data")
-        return
+        await context.bot.send_message(
+            user.id,
+            f"🎉 Поздравляем! Вы выиграли в розыгрыше #{gid}.\n"
+            f"Приз: {result}\n"
+            "Ваши очки увеличены на +10.",
+        )
+    except Exception as exc:
+        logger.warning("Could not DM user %s: %s", user.id, exc)
 
-    action = data.get("action")
-    game_id = int(data.get("game_id")) if data.get("game_id") else None
-    user = update.effective_user
-
-    if action == "request_spin":
-        # server-side choose prize and close
-        async with aiosqlite.connect(DB_PATH) as db:
-            game = await db.execute("SELECT id, title, mode, payload_json, status FROM games WHERE id=?", (game_id,)).fetchone()
-            if not game:
-                await msg.reply_text("Розыгрыш не найден.")
-                return
-            if game[4] != "open":
-                await msg.reply_text("Розыгрыш уже закрыт.")
-                return
-            payload = json.loads(game[3])
-            slices = payload.get("slices", [])
-            result = weighted_pick(slices)
-            # mark participant
-            await db.execute("INSERT OR IGNORE INTO participants(game_id, user_id, username, joined_at) VALUES (?, ?, ?, ?)",
-                             (game_id, user.id, user.username or user.full_name, now_iso()))
-            # update game closed
-            await db.execute("UPDATE games SET status='closed', result=?, winner_user_id=?, winner_name=?, ends_at=? WHERE id=?",
-                             (result, user.id, user.username or user.full_name, now_iso(), game_id))
-            # award points
-            await db.execute("INSERT OR IGNORE INTO users (user_id, username, points, streak, created_at) VALUES (?, ?, 0, 0, ?)",
-                             (user.id, user.username or user.full_name, now_iso()))
-            await db.execute("UPDATE users SET points = points + 10 WHERE user_id=?", (user.id,))
-            await db.commit()
-        await msg.reply_text(f"🎡 Вы попросили крутнуть колесо: результат — {result}. Поздравляю!")
-        # announce in chat (same chat where webapp was opened)
-        try:
-            await context.bot.send_message(msg.chat_id, f"🎉 @{user.username or user.full_name} выиграл(а) в розыгрыше #{game_id}: {result}")
-        except Exception:
-            pass
-        return
-
-    if action == "request_vault_open":
-        async with aiosqlite.connect(DB_PATH) as db:
-            game = await db.execute("SELECT id, title, mode, payload_json, status FROM games WHERE id=?", (game_id,)).fetchone()
-            if not game:
-                await msg.reply_text("Розыгрыш не найден.")
-                return
-            if game[4] != "open":
-                await msg.reply_text("Сундук уже открыт/закрыт.")
-                return
-            payload = json.loads(game[3])
-            prizes = payload.get("prizes", [])
-            result = weighted_pick(prizes)
-            await db.execute("INSERT OR IGNORE INTO participants(game_id, user_id, username, joined_at) VALUES (?, ?, ?, ?)",
-                             (game_id, user.id, user.username or user.full_name, now_iso()))
-            await db.execute("UPDATE games SET status='closed', result=?, winner_user_id=?, winner_name=?, ends_at=? WHERE id=?",
-                             (result, user.id, user.username or user.full_name, now_iso(), game_id))
-            await db.execute("INSERT OR IGNORE INTO users (user_id, username, points, streak, created_at) VALUES (?, ?, 0, 0, ?)",
-                             (user.id, user.username or user.full_name, now_iso()))
-            await db.execute("UPDATE users SET points = points + 15 WHERE user_id=?", (user.id,))
-            await db.commit()
-        await msg.reply_text(f"🔓 Сундук открыт! Вы получили: {result}. Поздравляем!")
-        try:
-            await context.bot.send_message(msg.chat_id, f"🗝️ @{user.username or user.full_name} открыл(а) Mystery Vault #{game_id} и получил(а): {result}")
-        except Exception:
-            pass
-        return
-
-    await msg.reply_text("Неизвестное действие от мини-приложения.")
 
 async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ADMIN_ID:
-        await update.message.reply_text("Только админ.")
+        await update.message.reply_text("Только администратор может просматривать статистику.")
         return
+
     async with aiosqlite.connect(DB_PATH) as db:
         total_games = await db.execute("SELECT COUNT(*) FROM games").fetchone()
         open_games = await db.execute("SELECT COUNT(*) FROM games WHERE status='open'").fetchone()
         total_users = await db.execute("SELECT COUNT(*) FROM users").fetchone()
-    await update.message.reply_text(
-        f"Всего игр: {total_games[0]}\nАктивных: {open_games[0]}\nПользователей: {total_users[0]}"
+        total_participants = await db.execute("SELECT COUNT(*) FROM participants").fetchone()
+
+    text = (
+        "📊 Статистика DARIKUM\n\n"
+        f"Всего розыгрышей: {total_games[0]}\n"
+        f"Активных: {open_games[0]}\n"
+        f"Пользователей: {total_users[0]}\n"
+        f"Участий: {total_participants[0]}\n"
     )
+    await update.message.reply_text(text)
+
+
+async def callback_router(update: Update, context: CallbackContext):
+    data = update.callback_query.data
+
+    if data == "list_games":
+        await callback_list_games(update, context)
+    elif data == "profile":
+        await callback_profile(update, context)
+    elif data.startswith("spin:"):
+        await callback_spin(update, context)
+    else:
+        await update.callback_query.answer("Неизвестная команда.", show_alert=True)
+
 
 async def main():
     await init_db()
     if not BOT_TOKEN:
-        raise RuntimeError("Добавьте BOT_TOKEN в окружение (.env)")
+        raise RuntimeError("BOT_TOKEN is missing. Add it to .env or environment variables.")
 
     app = ApplicationBuilder().token(BOT_TOKEN).build()
 
     app.add_handler(CommandHandler("start", cmd_start))
+    app.add_handler(CommandHandler("help", cmd_help))
     app.add_handler(CommandHandler("list", cmd_list))
+    app.add_handler(CommandHandler("join", cmd_join))
+    app.add_handler(CommandHandler("my", cmd_my))
     app.add_handler(CommandHandler("create_spin", cmd_create_spin))
-    app.add_handler(CommandHandler("create_vault", cmd_create_vault))
+    app.add_handler(CommandHandler("end_spin", cmd_end_spin))
     app.add_handler(CommandHandler("stats", cmd_stats))
+    app.add_handler(CommandHandler("admin", cmd_admin))
 
-    # обработчик web_app_data (мин. приложение шлёт данные через Telegram.WebApp.sendData)
-    app.add_handler(MessageHandler(filters.ALL, handle_webapp_message))
+    app.add_handler(CallbackQueryHandler(callback_router))
 
-    logger.info("Starting DARIKUM bot (no integrated webserver). WEBAPP_BASE_URL=%s", WEBAPP_BASE_URL)
+    logger.info("Starting DARIKUM bot...")
     await app.run_polling()
+
 
 if __name__ == "__main__":
     import asyncio
