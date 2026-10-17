@@ -147,10 +147,13 @@ async def init_db():
 # FastAPI app & static files
 WEBAPP_DIR = os.path.join(os.path.dirname(__file__), "webapp")
 app = FastAPI()
-if os.path.isdir(WEBAPP_DIR):
-    app.mount("/webapp", StaticFiles(directory=WEBAPP_DIR), name="webapp")
-    app.mount("/", StaticFiles(directory=WEBAPP_DIR), name="root")
 
+if os.path.isdir(WEBAPP_DIR):
+    app.mount(
+        "/webapp",
+        StaticFiles(directory=WEBAPP_DIR),
+        name="webapp"
+    )
 @app.get("/api/cases")
 async def api_cases():
     async with aiosqlite.connect(DB_PATH) as db:
