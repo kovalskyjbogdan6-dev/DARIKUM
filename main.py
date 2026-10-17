@@ -5,6 +5,9 @@ import random
 import logging
 from datetime import datetime, timedelta
 
+from pathlib import Path
+from fastapi.responses import FileResponse  
+
 import aiosqlite
 from fastapi import FastAPI, Request
 from fastapi.staticfiles import StaticFiles
@@ -33,6 +36,14 @@ WEBAPP_BASE_URL = os.getenv("WEBAPP_BASE_URL", "").rstrip("/")
 
 # Создаем FastAPI приложение, которое ожидает Uvicorn
 app = FastAPI()
+WEBAPP_DIR = Path(__file__).resolve().parent / "webapp"
+ASSETS_DIR = WEBAPP_DIR / "webapp"
+
+app.mount(
+    "/static",
+    StaticFiles(directory=str(ASSETS_DIR)),
+    name="static",
+)
 
 # Если папка с веб-приложением называется webapp, подключаем статику (при необходимости)
 # app.mount("/static", StaticFiles(directory="webapp"), name="static")
