@@ -339,4 +339,4 @@ async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # Базовый роут FastAPI (чтобы при открытии корневой страницы не было ошибок 404)
 @app.get("/")
 async def root():
-    return {"status": "ok", "message": "DARIKUM WebApp backend is running"}
+    return FileResponse(WEBAPP_DIR / "index.html")
