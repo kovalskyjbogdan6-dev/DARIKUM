@@ -163,17 +163,12 @@ async def api_cases():
         payload = json.loads(payload_json) if payload_json else {}
         out.append({"id": cid, "title": title, "image": image, "payload": payload, "price": price})
     return out
-
-@app.get("/api/case/{case_id}")
-async def api_case(case_id: int):
-    async with aiosqlite.connect(DB_PATH) as db:
-        row = await db.execute(
-            "SELECT id, title, image, payload_json, price FROM cases WHERE id = ?", (case_id,)
-        ).fetchone()
-    if not row:
-        return {"error": "not found"}
-    cid, title, image, payload_json, price = row
-    return {"id": cid, "title": title, "image": image, "payload": json.loads(payload_json) if payload_json else {}, "price": price}
+if os.path.isdir(WEBAPP_DIR):
+    app.mount(
+        "/",
+        StaticFiles(directory=WEBAPP_DIR, html=True),
+        name="root"
+    )
 
 # Telegram bot
 def admin_only(func):
