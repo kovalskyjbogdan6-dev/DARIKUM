@@ -24,7 +24,11 @@ from telegram.ext import (
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 ADMIN_ID = int(os.getenv("ADMIN_ID", "1040670594"))
 DB_PATH = os.getenv("DB_PATH", "darikum.db")
-WEBAPP_BASE_URL = os.getenv("WEBAPP_BASE_URL", "").rstrip("/")
+
+# Support both names: WEBAPP_BASE_URL or WEBAPP_URL
+_webapp_env = os.getenv("WEBAPP_BASE_URL") or os.getenv("WEBAPP_URL") or ""
+WEBAPP_BASE_URL = _webapp_env.rstrip("/") if _webapp_env else ""
+
 PORT = int(os.getenv("PORT", "8000"))
 
 logging.basicConfig(level=logging.INFO)
@@ -98,8 +102,8 @@ async def init_db():
 
         # seed example cases if none
         cur = await db.execute("SELECT COUNT(*) FROM cases")
-        cnt_row = await cur.fetchone()
-        cnt = cnt_row[0] if cnt_row else 0
+        row = await cur.fetchone()
+        cnt = row[0] if row else 0
         if cnt == 0:
             sample = [
                 {
@@ -127,9 +131,9 @@ async def init_db():
                     "image": "/webapp/assets/case3.png",
                     "price": 3,
                     "items": [
-                        {"label":"Common","weight":70},
-                        {"label":"Uncommon","weight":20},
-                        {"label":"Rare","weight":10}
+                        {"label": "Common", "weight": 70},
+                        {"label": "Uncommon", "weight": 20},
+                        {"label": "Rare", "weight": 10}
                     ]
                 }
             ]
@@ -161,7 +165,9 @@ async def api_cases():
 @app.get("/api/case/{case_id}")
 async def api_case(case_id: int):
     async with aiosqlite.connect(DB_PATH) as db:
-        row = await db.execute("SELECT id, title, image, payload_json, price FROM cases WHERE id=?", (case_id,)).fetchone()
+        row = await db.execute(
+            "SELECT id, title, image, payload_json, price FROM cases WHERE id = ?", (case_id,)
+        ).fetchone()
     if not row:
         return {"error": "not found"}
     cid, title, image, payload_json, price = row
@@ -220,132 +226,5 @@ def build_bot_app():
             await update.message.reply_text("Ошибка формата. Пример:\n/add_case Promo|1|Sticker:80,Box:20|/webapp/assets/case1.png")
             return
         async with aiosqlite.connect(DB_PATH) as db:
-            await db.execute("INSERT INTO cases(title, image, payload_json, price, created_at) VALUES (?, ?, ?, ?, ?)",
-                             (title, image, json.dumps({"items": items}, ensure_ascii=False), price, now_iso()))
-            await db.commit()
-        await update.message.reply_text("Кейс добавлен.")
-
-    async def handle_webapp_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-        msg = update.message
-        if not msg or not getattr(msg, "web_app_data", None):
-            return
-        try:
-            data = json.loads(msg.web_app_data.data)
-        except Exception:
-            await msg.reply_text("Ошибка данных от мини‑приложения.")
-            return
-
-        action = data.get("action")
-        case_id = int(data.get("case_id")) if data.get("case_id") else None
-        user = update.effective_user
-
-        if action == "open_case" and case_id:
-            async with aiosqlite.connect(DB_PATH) as db:
-                row = await db.execute("SELECT payload_json FROM cases WHERE id=?", (case_id,)).fetchone()
-                if not row:
-                    await msg.reply_text("Кейс не найден.")
-                    return
-                payload = json.loads(row[0]) if row[0] else {}
-                items = payload.get("items", [])
-                result = weighted_pick(items) or "Пусто"
-
-                await db.execute("INSERT INTO openings(case_id, user_id, username, result, opened_at) VALUES (?, ?, ?, ?, ?)",
-                                 (case_id, user.id, user.username or user.full_name, result, now_iso()))
-                await db.execute("INSERT OR IGNORE INTO users(user_id, username, points, streak, created_at) VALUES (?, ?, 0, 0, ?)",
-                                 (user.id, user.username or user.full_name, now_iso()))
-                await db.execute("UPDATE users SET points = points + 10 WHERE user_id = ?", (user.id,))
-                await db.execute("INSERT OR IGNORE INTO stats(user_id, wins, opens) VALUES (?, 0, 0)", (user.id,))
-                await db.execute("UPDATE stats SET opens = opens + 1 WHERE user_id = ?", (user.id,))
-                await db.commit()
-
-            await msg.reply_text(f"🎉 Вы открыли кейс и получили: {result}")
-            try:
-                await context.bot.send_message(msg.chat_id, f"🎉 @{user.username or user.full_name} открыл кейс #{case_id} и получил: {result}")
-            except Exception:
-                logger.exception("Не удалось оповестить чат")
-            return
-
-        await msg.reply_text("Неизвестное действие от мини‑приложения.")
-
-    app_bot.add_handler(CommandHandler("start", cmd_start))
-    app_bot.add_handler(CommandHandler("add_case", cmd_add_case))
-    app_bot.add_handler(MessageHandler(filters.ALL, handle_webapp_message))
-    return app_bot
-
-# ---------- startup/shutdown for FastAPI (run bot in background properly) ----------
-_bot_app = None
-_bot_polling_task = None
-
-@app.on_event("startup")
-async def startup_event():
-    global _bot_app, _bot_polling_task
-    await init_db()
-
-    if not BOT_TOKEN:
-        logger.warning("BOT_TOKEN not set; bot will not start.")
-        return
-
-    _bot_app = build_bot_app()
-    if not _bot_app:
-        return
-
-    try:
-        logger.info("Initializing telegram application...")
-        await _bot_app.initialize()
-        logger.info("Starting telegram application...")
-        await _bot_app.start()
-
-        # start polling via updater as background task (PTB 20.x)
-        if getattr(_bot_app, "updater", None) is not None and hasattr(_bot_app.updater, "start_polling"):
-            logger.info("Starting updater.start_polling() as background task")
-            _bot_polling_task = asyncio.create_task(_bot_app.updater.start_polling())
-        else:
-            logger.warning("Updater or start_polling not available; polling not started")
-    except Exception:
-        logger.exception("Failed to start bot in startup_event")
-        try:
-            await _bot_app.shutdown()
-        except Exception:
-            pass
-
-@app.on_event("shutdown")
-async def shutdown_event():
-    global _bot_app, _bot_polling_task
-    if _bot_app is None:
-        return
-
-    logger.info("Shutting down Telegram bot...")
-    try:
-        if getattr(_bot_app, "updater", None) is not None and hasattr(_bot_app.updater, "stop_polling"):
-            try:
-                await _bot_app.updater.stop_polling()
-            except Exception:
-                logger.exception("Error stopping updater polling")
-    except Exception:
-        logger.exception("Error during stopping polling")
-
-    if _bot_polling_task is not None:
-        _bot_polling_task.cancel()
-        try:
-            await _bot_polling_task
-        except asyncio.CancelledError:
-            pass
-        except Exception:
-            logger.exception("Error awaiting _bot_polling_task")
-
-    try:
-        await _bot_app.stop()
-    except Exception:
-        logger.exception("Error on _bot_app.stop()")
-    try:
-        await _bot_app.shutdown()
-    except Exception:
-        logger.exception("Error on _bot_app.shutdown()")
-
-    _bot_app = None
-    _bot_polling_task = None
-
-# ---------- run ----------
-if __name__ == "__main__":
-    uvicorn.run("main:app", host="0.0.0.0", port=PORT, log_level="info")
-    
+            await db*
+
